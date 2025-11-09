@@ -89,7 +89,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--save_trace", type=str, default="")
-    parser.add_argument("--engine", type=str, choices=["bm25", "tfidf"], default="bm25", help="选择检索引擎")
+    parser.add_argument("--engine", type=str, choices=["bm25", "tfidf"], default="tfidf", help="选择检索引擎")
     args = parser.parse_args()
     # Prepare test samples
     df_test = pd.read_csv(TEST_CSV_PATH)
@@ -129,6 +129,11 @@ if __name__ == "__main__":
             conv = str(row.get("Best Generated Conversation", ""))
             qa_pairs = parse_conversation_for_qa(conv)
             for asker, question, answerer, answer in qa_pairs:
+                # --- 注入 ? 过滤器 [START] ---
+                # 只保留 User 2 的提问，且问句必须以 ? 结尾
+                if asker != "User 2" or not str(question).strip().endswith("?"):
+                    continue
+                # --- 注入 ? 过滤器 [END] ---
                 # 用启发式选择可能引用人设的样本
                 gt_candidates = u1_personas if answerer == "User 1" else u2_personas
                 if not gt_candidates:

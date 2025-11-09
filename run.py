@@ -90,13 +90,27 @@ def main():
             line = conversation_lines[i].strip()
             next_line = conversation_lines[i+1].strip()
             if line.startswith("User 2:") and next_line.startswith("User 1:"):
+                # A. 提取 Q&A
                 question = line.replace("User 2:", "").strip()
                 ground_truth_answer = next_line.replace("User 1:", "").strip()
                 history_context = "\n".join(conversation_history)
+
+                # --- 注入 ? 过滤器 [START] ---
+                # 过滤掉所有非提问的寒暄
+                if not question.endswith("?"):
+                    if args.verbose:
+                        print(f"\n(跳过非提问句: {question})")
+                    conversation_history.append(line)  # 仍然要更新历史
+                    conversation_history.append(next_line)
+                    continue  # 跳过 RAG 和模型生成
+                # --- 注入 ? 过滤器 [END] ---
                 if not question:
                     continue
                 retrieved_results = retriever.retrieve(question, top_k=args.top_k)
                 retrieved_personas_text = [res[0] for res in retrieved_results]
+                # 1) 获取检索到的人设索引，格式化为标签
+                retrieved_indices_1based = sorted([res[1] for res in retrieved_results])
+                tags_str = " ".join(f"[{idx}]" for idx in retrieved_indices_1based)
                 prompt = build_prompt(
                     persona_context=retrieved_personas_text,
                     history=history_context,
@@ -108,7 +122,9 @@ def main():
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 with torch.no_grad():
                     outputs = model.generate(**inputs, max_new_tokens=50, pad_token_id=tokenizer.eos_token_id)
-                generated_text = tokenizer.decode(outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True)
+                generated_text = tokenizer.decode(outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
+                # 2) 手动将标签拼接到输出末尾
+                final_output = f"{generated_text} {tags_str}".strip()
                 print(f"\n{Colors.YELLOW}===== 1) 问题 (User 2) ====={Colors.ENDC}")
                 print(question)
                 if args.verbose:
@@ -119,8 +135,8 @@ def main():
                     print(f"{Colors.YELLOW}===== 4) 实际检索 (Top-{args.top_k} {args.engine}) ====={Colors.ENDC}")
                     for text, idx in retrieved_results:
                         print(f"[{idx}] {text}")
-                print(f"{Colors.RED}===== 5) 实际输出 (模型生成) ====={Colors.ENDC}")
-                print(generated_text)
+                print(f"{Colors.RED}===== 5) 实际输出 (模型生成 + 手动标签) ====={Colors.ENDC}")
+                print(final_output)
                 pairs_printed += 1
                 if args.max_pairs_per_dialogue and pairs_printed >= args.max_pairs_per_dialogue:
                     break
@@ -135,7 +151,7 @@ def main():
                             "kb_list": kb_list,
                             "retrieved": [{"idx": int(idx), "text": text} for text, idx in retrieved_results],
                             "prompt": prompt,
-                            "generated": generated_text,
+                            "generated": final_output,
                             "engine": args.engine,
                             "top_k": int(args.top_k),
                         }

@@ -142,8 +142,19 @@ def build_dataset(tokenizer, dataset_name):
             line = conversation_lines[i].strip()
             next_line = conversation_lines[i + 1].strip()
             if line.startswith("User 2:") and next_line.startswith("User 1:"):
+                # A. 提取 Q&A
                 question = line.replace("User 2:", "").strip()
                 answer_text = next_line.replace("User 1:", "").strip()
+
+                # --- 注入 ? 过滤器 [START] ---
+                # 过滤掉所有非提问的寒暄
+                if not question.endswith("?"):
+                    conversation_history.append(line)  # 仍然要更新历史
+                    conversation_history.append(next_line)
+                    continue  # 跳过这个“有毒”的训练样本
+                # --- 注入 ? 过滤器 [END] ---
+
+                # B. 构建当前历史
                 history_context = "\n".join(conversation_history)
                 try:
                     if not question:
@@ -157,12 +168,13 @@ def build_dataset(tokenizer, dataset_name):
                     retrieved_personas = [kb_list[idx] for idx in top_2_indices_0based]
                     top_2_indices_1based = sorted([int(idx) + 1 for idx in top_2_indices_0based])
                     tags = " ".join(f"[{idx}]" for idx in top_2_indices_1based)
-                    answer_with_tags = f"{answer_text} {tags}"
+                    # 停止在训练样本中附加标签，只保留纯文本答案
+                    answer_without_tags = answer_text
                     completion_str = build_prompt(
                         persona_context=retrieved_personas,
                         history=history_context,
                         question=question,
-                        answer_with_tags=answer_with_tags,
+                        answer_with_tags=answer_without_tags,
                     )
                     dataset_completions.append(completion_str)
                     # 收集可视化样本（最多缓存100条）
@@ -175,7 +187,7 @@ def build_dataset(tokenizer, dataset_name):
                             "history": history_context,
                             "question": question,
                             "answer_text": answer_text,
-                            "answer_with_tags": answer_with_tags,
+                            "answer_with_tags": f"{answer_text} {tags}",
                             "completion": completion_str,
                         })
                 except Exception:
@@ -246,6 +258,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_best", action="store_true")
+    # 按步评估：每隔N步触发一次 evaluate（通过回调实现，兼容老版本 transformers）
+    parser.add_argument("--eval_every_n_steps", type=int, default=200)
     # 预览/可视化
     parser.add_argument("--preview_n", type=int, default=0, help="打印前N条构造的伪RAG+标签样本")
     parser.add_argument("--preview_out", type=str, default=None, help="预览样本保存为JSONL文件路径")
@@ -485,6 +499,20 @@ if __name__ == "__main__":
             else:
                 control.should_evaluate = False
 
+    @dataclass
+    class StepEvalEveryNCallback(TrainerCallback):
+        """Trigger evaluation every N steps via control.should_evaluate."""
+        n: int = 0
+
+        def on_step_end(self, args, state, control, **kwargs):
+            try:
+                step = int(state.global_step)
+            except Exception:
+                step = None
+            if self.n and step and step > 0 and (step % self.n == 0):
+                control.should_evaluate = True
+            return control
+
     # 根据开关选择训练器
     if args.use_trl and SFTTrainer is not None:
         trainer = SFTTrainer(
@@ -509,7 +537,11 @@ if __name__ == "__main__":
 
     # Register callbacks
     trainer.add_callback(LossLoggerCallback())
-    trainer.add_callback(EpochEvalEveryNCallback(n=max(1, int(args.eval_every_n_epochs))))
+    # 优先按“每N步评估”；否则按“每N个epoch评估”
+    if args.eval_every_n_steps and int(args.eval_every_n_steps) > 0:
+        trainer.add_callback(StepEvalEveryNCallback(n=int(args.eval_every_n_steps)))
+    else:
+        trainer.add_callback(EpochEvalEveryNCallback(n=max(1, int(args.eval_every_n_epochs))))
     if args.save_best:
         best_cb = BestCheckpointCallback(output_dir=args.output_dir, tokenizer=tokenizer, metric_name="eval_loss", greater_is_better=False)
         # attach trainer for saving API
