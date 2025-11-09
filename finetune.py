@@ -11,15 +11,35 @@ from transformers import (
     DataCollatorForLanguageModeling,
     TrainerCallback,
     set_seed,
+    BitsAndBytesConfig,
 )
-
-import os
 import math
-from dataclasses import dataclass
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 import torch
 import json
+try:
+    import bitsandbytes as bnb  # 可选
+except Exception:
+    bnb = None
+try:
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training  # 可选
+except Exception:
+    LoraConfig = None
+    get_peft_model = None
+    prepare_model_for_kbit_training = None
+try:
+    from trl import SFTTrainer  # 可选
+except Exception:
+    SFTTrainer = None
+from trl import SFTTrainer
+import os
+from dataclasses import dataclass
 from retriever import BM25Retriever
 
+# 预览缓存（用于可视化检查，最多缓存100条）
+FINETUNE_PREVIEW: List[Dict] = []
 
 MODEL_NAME = "Qwen/Qwen1.5-1.8B-Chat"
 TRAIN_CSV_PATH = "../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_train.csv"
@@ -69,6 +89,107 @@ def build_training_text(row: Dict[str, str], k: int = 2) -> str:
     personas_section = " ".join([f"Persona 1: {p}" for p in u1_personas] + [f"Persona 2: {p}" for p in u2_personas])
     text = f"[CONTEXT] {personas_section} [DIALOGUE] {convo}"
     return text
+
+
+def build_prompt(persona_context: list, history: str, question: str, answer_with_tags: str = None):
+    """
+    根据 HW1数据说明.pdf 构建 prompt 和 completion
+    """
+    # 1. 构建 Persona 上下文
+    persona_str = "\n".join(persona_context)
+
+    # 2. 构建 Prompt
+    prompt = f"Your Personas:\n{persona_str}\n\n"
+    prompt += f"Conversation History:\n{history}\n\n"
+    prompt += f"User 2's response:\n{question}\n\n"  # User 2 是提问者
+    prompt += "User 1's response:\n"  # 这是模型要开始生成的地方
+
+    if answer_with_tags:
+        # 如果提供了答案（用于训练），则构建 completion
+        completion = f"{prompt}{answer_with_tags}"
+        return completion
+    else:
+        # 否则只返回 prompt (用于推理)
+        return prompt
+
+
+def build_dataset(tokenizer, dataset_name):
+    """
+    重写 build_dataset 以符合 HW1数据说明.pdf 和 CSV 格式。
+    - User 1 是 助手 (KB: user 1 personas)
+    - User 2 是 用户 (提问者)
+    - 模拟 TF-IDF RAG 来检索 Top-2 personas 并生成 [i] [j] 标签。
+    """
+    try:
+        data = pd.read_csv(dataset_name).fillna("")
+    except Exception as e:
+        print(f"Error loading {dataset_name}: {e}")
+        return Dataset.from_dict({"text": []})
+
+    dataset_completions: List[str] = []
+    print(f"Building dataset from {dataset_name}...")
+
+    for ridx, (_, row) in enumerate(tqdm(data.iterrows(), total=len(data), desc="Processing conversations")):
+        kb_personas_str = str(row.get("user 1 personas", ""))
+        kb_list = [p.strip() for p in kb_personas_str.split('\n') if p.strip()]
+        if len(kb_list) < 2:
+            continue
+
+        conversation_lines = str(row.get("Best Generated Conversation", "")).split('\n')
+        conversation_history: List[str] = []
+
+        for i in range(len(conversation_lines) - 1):
+            line = conversation_lines[i].strip()
+            next_line = conversation_lines[i + 1].strip()
+            if line.startswith("User 2:") and next_line.startswith("User 1:"):
+                question = line.replace("User 2:", "").strip()
+                answer_text = next_line.replace("User 1:", "").strip()
+                history_context = "\n".join(conversation_history)
+                try:
+                    if not question:
+                        continue
+                    vectorizer = TfidfVectorizer().fit([question] + kb_list)
+                    tfidf_matrix = vectorizer.transform([question] + kb_list)
+                    question_vec = tfidf_matrix[0]
+                    kb_vecs = tfidf_matrix[1:]
+                    similarities = cosine_similarity(question_vec, kb_vecs)[0]
+                    top_2_indices_0based = similarities.argsort()[-2:]
+                    retrieved_personas = [kb_list[idx] for idx in top_2_indices_0based]
+                    top_2_indices_1based = sorted([int(idx) + 1 for idx in top_2_indices_0based])
+                    tags = " ".join(f"[{idx}]" for idx in top_2_indices_1based)
+                    answer_with_tags = f"{answer_text} {tags}"
+                    completion_str = build_prompt(
+                        persona_context=retrieved_personas,
+                        history=history_context,
+                        question=question,
+                        answer_with_tags=answer_with_tags,
+                    )
+                    dataset_completions.append(completion_str)
+                    # 收集可视化样本（最多缓存100条）
+                    if len(FINETUNE_PREVIEW) < 100:
+                        FINETUNE_PREVIEW.append({
+                            "row_index": ridx,
+                            "kb_list": kb_list,
+                            "retrieved_indices_1based": top_2_indices_1based,
+                            "retrieved_personas": retrieved_personas,
+                            "history": history_context,
+                            "question": question,
+                            "answer_text": answer_text,
+                            "answer_with_tags": answer_with_tags,
+                            "completion": completion_str,
+                        })
+                except Exception:
+                    pass
+
+                conversation_history.append(line)
+                conversation_history.append(next_line)
+            elif line.startswith("User 1:") or line.startswith("User 2:"):
+                conversation_history.append(line)
+
+    print(f"Finished building dataset. Total samples: {len(dataset_completions)}")
+    dataset_final = Dataset.from_dict({"text": dataset_completions})
+    print(f"Converted to Hugging Face Dataset object.")
+    return dataset_final
 
 
 def preprocess_function(examples, tokenizer, max_length: int):
@@ -125,6 +246,14 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_best", action="store_true")
+    # 预览/可视化
+    parser.add_argument("--preview_n", type=int, default=0, help="打印前N条构造的伪RAG+标签样本")
+    parser.add_argument("--preview_out", type=str, default=None, help="预览样本保存为JSONL文件路径")
+    # 训练器选择
+    parser.add_argument("--use_trl", action="store_true", help="使用 TRL 的 SFTTrainer（需已安装 trl）")
+    # Tokenizer 复用/离线
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="从本地目录加载/保存 tokenizer（避免反复远端拉取）")
+    parser.add_argument("--local_files_only", action="store_true", help="仅使用本地缓存文件加载（不访问网络）")
     args = parser.parse_args()
     # Set seed for reproducibility
     try:
@@ -132,48 +261,98 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Load raw data with pandas, then convert to HuggingFace Dataset
-    df = pd.read_csv(args.train_csv_path)
-    raw_dataset = Dataset.from_pandas(df)
+    # 使用新数据构建：从 CSV 生成带 prompt+completion 的文本样本
+    train_text_dataset = build_dataset(tokenizer=None, dataset_name=args.train_csv_path)
+    # 预览可视化
+    if args.preview_n and args.preview_n > 0:
+        print(f"[Preview] Show first {min(args.preview_n, len(FINETUNE_PREVIEW))} samples from constructed dataset...")
+        for i, rec in enumerate(FINETUNE_PREVIEW[:args.preview_n], 1):
+            print(f"\n==== Preview Sample #{i} ====")
+            print(f"KB(size={len(rec.get('kb_list', []))}):")
+            for idx, p in enumerate(rec.get("kb_list", []), 1):
+                print(f"[{idx}] {p}")
+            print("- Question:", rec.get("question", ""))
+            print("- Retrieved (1-based idx):", rec.get("retrieved_indices_1based", []))
+            print("- Retrieved personas:", rec.get("retrieved_personas", []))
+            print("- History:\n", rec.get("history", ""))
+            print("- Answer with tags:", rec.get("answer_with_tags", ""))
+            print("- Completion (prompt+answer):\n", rec.get("completion", "")[:1000])
+        if args.preview_out:
+            try:
+                out_dir = os.path.dirname(args.preview_out)
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+            except Exception:
+                pass
+            try:
+                with open(args.preview_out, "w", encoding="utf-8") as f:
+                    for rec in FINETUNE_PREVIEW[:args.preview_n]:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(f"[Preview] Saved {min(args.preview_n, len(FINETUNE_PREVIEW))} samples to {args.preview_out}")
+            except Exception as e:
+                print(f"[Preview] Failed to save preview to {args.preview_out}: {e}")
 
     # Enable trust_remote_code for models like Qwen if requested
     trust_remote = args.trust_remote_code or ("qwen" in args.model_name.lower())
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=trust_remote)
+    # 优先从本地 tokenizer_path 复用；否则从模型名加载
+    tokenizer_source = args.tokenizer_path if args.tokenizer_path else args.model_name
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        trust_remote_code=trust_remote,
+        local_files_only=bool(args.local_files_only)
+    )
     # GPT-2 often needs an explicit pad token for batching
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # 若指定了 tokenizer_path 且目录存在/可写，将当前 tokenizer 保存，便于后续直接离线复用
+    if args.tokenizer_path:
+        try:
+            os.makedirs(args.tokenizer_path, exist_ok=True)
+            tokenizer.save_pretrained(args.tokenizer_path)
+        except Exception:
+            pass
 
     model_load_kwargs = {"trust_remote_code": trust_remote}
     if args.bf16:
         model_load_kwargs["torch_dtype"] = torch.bfloat16
     model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
 
-    def hf_preprocess(batch):
-        return preprocess_function(batch, tokenizer, args.max_length)
+    def tokenize_text(batch):
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=args.max_length,
+            padding=False,
+            return_special_tokens_mask=False,
+        )
 
-    tokenized_dataset = raw_dataset.map(
-        hf_preprocess,
-        batched=True,
-        remove_columns=raw_dataset.column_names,
-        desc="Tokenizing",
-    )
-
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    tokenized_dataset = None
+    data_collator = None
+    if not args.use_trl:
+        tokenized_dataset = train_text_dataset.map(
+            tokenize_text,
+            batched=True,
+            remove_columns=train_text_dataset.column_names,
+            desc="Tokenizing",
+        )
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     # Prepare validation dataset if provided
     eval_dataset = None
+    eval_text_dataset = None
     if args.valid_csv_path and os.path.exists(args.valid_csv_path):
         try:
-            df_valid = pd.read_csv(args.valid_csv_path)
-            raw_valid = Dataset.from_pandas(df_valid)
-            eval_dataset = raw_valid.map(
-                hf_preprocess,
-                batched=True,
-                remove_columns=raw_valid.column_names,
-                desc="Tokenizing (valid)",
-            )
+            eval_text_dataset = build_dataset(tokenizer=None, dataset_name=args.valid_csv_path)
+            if not args.use_trl:
+                eval_dataset = eval_text_dataset.map(
+                    tokenize_text,
+                    batched=True,
+                    remove_columns=eval_text_dataset.column_names,
+                    desc="Tokenizing (valid)",
+                )
         except Exception:
             eval_dataset = None
+            eval_text_dataset = None
 
     # Configure logging backend
     report_to = []
@@ -306,14 +485,27 @@ if __name__ == "__main__":
             else:
                 control.should_evaluate = False
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        tokenizer=tokenizer,
-    )
+    # 根据开关选择训练器
+    if args.use_trl and SFTTrainer is not None:
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=training_args,
+            train_dataset=train_text_dataset,
+            eval_dataset=eval_text_dataset,
+            dataset_text_field="text",
+        )
+    else:
+        if args.use_trl and SFTTrainer is None:
+            print("[Warn] --use_trl 指定但未检测到 TRL；回退到 transformers.Trainer。")
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+        )
 
     # Register callbacks
     trainer.add_callback(LossLoggerCallback())

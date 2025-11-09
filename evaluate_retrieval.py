@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 import pandas as pd
 
-from retriever import BM25Retriever
+from retriever import Retriever
 
 
 # Paths
@@ -89,6 +89,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--save_trace", type=str, default="")
+    parser.add_argument("--engine", type=str, choices=["bm25", "tfidf"], default="bm25", help="选择检索引擎")
     args = parser.parse_args()
     # Prepare test samples
     df_test = pd.read_csv(TEST_CSV_PATH)
@@ -110,9 +111,10 @@ if __name__ == "__main__":
             # 解析 GT：assistant_utterance_grounded_on_persona_facts（多行）
             gt_col = str(row.get("assistant_utterance_grounded_on_persona_facts", ""))
             gt_list = [ln.strip() for ln in gt_col.splitlines() if ln.strip()]
-            # 本地检索
-            retr = BM25Retriever(local_persona_facts=local_facts)
-            retrieved = retr.retrieve_top_k(query, k=args.top_k)
+            # 本地检索（按新API：per-dialogue KB）
+            retr = Retriever(kb_list=local_facts, engine=args.engine)
+            pairs = retr.retrieve(query, top_k=args.top_k)
+            retrieved = [t for (t, _) in pairs]
             hit = calculate_recall(retrieved, gt_list)
             total_hits += hit
             total_samples += 1
@@ -133,8 +135,9 @@ if __name__ == "__main__":
                     continue
                 if not find_ground_truth_matches(answer, gt_candidates):
                     continue
-                retr = BM25Retriever(local_persona_facts=local_facts)
-                retrieved = retr.retrieve_top_k(question, k=args.top_k)
+                retr = Retriever(kb_list=local_facts, engine=args.engine)
+                pairs = retr.retrieve(question, top_k=args.top_k)
+                retrieved = [t for (t, _) in pairs]
                 hit = calculate_recall(retrieved, gt_candidates)
                 total_hits += hit
                 total_samples += 1

@@ -3,21 +3,44 @@
 本指南说明如何在本项目中完成从数据加载、检索评估、到微调与构建完整 RAG 流程的全部步骤。
 
 ### 目录结构
-- `retriever.py`: 基于 BM25 的“本地人设检索”器（仅在当前样本的人设列表上检索）。
+- `retriever.py`: 支持 BM25/TF-IDF 的“本地人设检索”器（仅在当前样本的人设列表上检索）。
 - `evaluate_retrieval.py`: 基于“每行样本的本地人设”评估 Recall@K。
-- `finetune.py`: 使用 `datasets` + `transformers` 微调因果语言模型，训练提示由“本地检索”构造。
-- `run.py`: 演示完整 RAG 流程（检索 + 生成）。
+- `finetune.py`: 使用 `datasets` + `transformers` 微调因果语言模型；通过“伪 RAG（TF-IDF）+ [i][j] 标签”构建训练数据；统一 Prompt。
+- `run.py`: 演示完整 RAG 流程（按对话动态构建KB → 检索 → 统一 Prompt → 生成），并打印 Ground Truth。
 - `requirements.txt`: 项目依赖列表。
 
 数据位于：`../Synthetic-Persona-Chat/data/`，包括 `Synthetic-Persona-Chat_train.csv`、`Synthetic-Persona-Chat_test.csv` 等。
 
+### 统一规范（与作业要求一致）
+- 统一数据格式：`finetune.py`、`run.py`、`retriever.py` 均直接解析 `Synthetic-Persona-Chat_*.csv` 的三列：
+  - `user 1 personas`（助手/检索KB来源）、`user 2 personas`、`Best Generated Conversation`
+- 统一角色：`User 1` 为助手（回答者），`User 2` 为用户（提问者）
+- 统一 Prompt（训练与推理一致）：
+  ```
+  Your Personas:
+  <persona 1>
+  <persona 2>
+  ...
+  
+  Conversation History:
+  <历史多轮对话（原样拼接）>
+  
+  User 2's response:
+  <当前用户提问>
+  
+  User 1's response:
+  <模型在此开始生成；训练样本末尾拼接带标签答案>
+  ```
+- 按对话(per-dialogue)构建KB：`run.py` 对每行对话读取 `user 1 personas` 为 KB，仅在该 KB 内检索（Top-2）。
+
 ### 基本检索实现与引擎切换
-- BM25 本地检索（`retriever.py`）
-  - `BM25Retriever(local_persona_facts: List[str])`：仅对传入的“本地人设列表”建立索引与检索。
-  - `retrieve_top_k(query, k)` / `retrieve_with_scores(...)`：返回本地 Top-K（及分数）。
-- 引擎切换（`run.py`）
-  - `--engine bm25`：演示本地检索；脚本会从传入 CSV 的第一行收集人设作为“本地facts”构建演示用检索器。
-  - `--engine lightrag`：baseline LightRAG（需 `ZHIPUAI_API_KEY` 与 `book.txt`）。
+- `retriever.py` 重构为统一接口：
+  - `Retriever(kb_list, engine='bm25'|'tfidf')`
+  - `retrieve(query, top_k)` 返回 `[(text, 1-based-index), ...]`
+- 实现两个引擎：
+  - BM25: `BM25Retriever(kb_list)` 使用 `rank_bm25`
+  - TF-IDF: `TFIDFRetriever(kb_list)` 使用 `scikit-learn`
+- `run.py` 支持 `--engine bm25|tfidf` 切换；每行对话动态创建检索器，Top-2 结果进入统一 Prompt。
 
 ### 环境准备
 1) 安装依赖
@@ -26,15 +49,22 @@
 pip install -r requirements.txt
 ```
 
-依赖包括：`pandas`, `rank_bm25`, `scikit-learn`, `datasets`, `transformers`, `torch`, `accelerate` 等。
+依赖包括：`pandas`, `rank_bm25`, `scikit-learn`, `datasets`, `transformers`, `torch`, `accelerate`, `tqdm` 等。
 
-### 运行步骤
+### 运行步骤（按作业阶段）
 
-1) 微调模型（保存至 `./my_finetuned_model`，训练日志通过 TensorBoard/WandB 记录；默认模型：Qwen/Qwen1.5-1.8B-Chat）
+#### 阶段一：微调（伪 RAG + 标签）
+- 训练数据构造（已内置于 `finetune.py`）：
+  - 使用 TF-IDF 在每场对话的 `user 1 personas` 上检索 Top-2
+  - 将对应的人设文本作为 Persona 上下文进入 Prompt
+  - 将答案拼接 `"[i] [j]"` 标签（i/j 为 1-based KB索引，排序保证稳定）
+  - 将 `history` 为之前的多轮对话串（User 1/2 原样累加）
+- 统一 Prompt/Completion（训练与推理一致）
+
+运行示例（保存至 `./my_finetuned_model`，日志可用 TensorBoard/WandB）：
 
 ```bash
-# TensorBoard 日志（默认）
-CUDA_VISIBLE_DEVICES=4 python finetune.py --log_backend tensorboard \
+CUDA_VISIBLE_DEVICES=5 python finetune.py --log_backend tensorboard \
   --train_csv_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_train.csv \
   --valid_csv_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_valid.csv \
   --model_name Qwen/Qwen1.5-1.8B --trust_remote_code \
@@ -92,7 +122,22 @@ CUDA_VISIBLE_DEVICES=7 python finetune.py \
 - `--save_best`：开启后按 `eval_loss` 保存最佳模型到 `checkpoint-best/`（不受 `save_total_limit` 清理影响）。
 - `--logging_steps`：日志步频，建议 10（便于在 TensorBoard/WandB 查看 step 级 train/eval 曲线）。
 
-2) 评估检索效果（Recall@K，基于“每行本地人设”）
+可选：使用 TRL 的 SFTTrainer
+
+- 若已安装 `trl`，可以添加 `--use_trl` 开关，直接使用 `SFTTrainer` 进行 SFT（对齐/指令微调更友好）：
+```bash
+CUDA_VISIBLE_DEVICES=5 python finetune.py --use_trl \
+  --train_csv_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_train.csv \
+  --valid_csv_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_valid.csv \
+  --model_name Qwen/Qwen1.5-1.8B --trust_remote_code \
+  --num_train_epochs 10 --eval_every_n_epochs 1 \
+  --learning_rate 1e-5 --weight_decay 0.1 --max_grad_norm 1.0 --bf16 \
+  --gradient_accumulation_steps 16 --warmup_ratio 0.03 --max_length 512 \
+  --seed 42 --save_best --logging_steps 10 --output_dir ./runs/qwen_run_trl
+```
+- 若未安装 `trl` 但指定了 `--use_trl`，脚本会自动回退到 transformers.Trainer 并提示 Warning。
+
+#### 阶段二：评估检索（Recall@2）
 
 ```bash
 # 评估 BM25 检索（保存追踪文件）
@@ -108,60 +153,53 @@ python evaluate_retrieval.py --top_k 2 --save_trace retrieval_trace.json
 - 否则回退到旧格式：从对话抽 QA，用启发式筛样本，再按子串重叠计算 Recall。
 - 可用 `--top_k` 控制 K；`--save_trace` 会输出逐样本检索追踪 JSON。
 
-3) 运行完整 RAG 流程示例（BM25 引擎，展示检索细节）
+#### 阶段三：RAG 推理（按对话动态KB + 统一 Prompt）
 
 ```bash
-python run.py --engine bm25 --top_k 2 --verbose --kb_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_train.csv --model_path ./my_finetuned_model
+python run.py --engine bm25 --top_k 2 --verbose \
+  --kb_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_test.csv \
+  --model_path ./runs/qwen_run-qwenchat/checkpoint-best
 ```
 
 说明：
-- `bm25` 引擎为演示用途：从传入 CSV 第一行构造“本地 facts”并初始化 `BM25Retriever`；随后加载 `./my_finetuned_model`，完成检索+生成与可选的细节打印。
+- `run.py` 会逐行读取 CSV（每行=一场对话），将该行 `user 1 personas` 作为 KB，按 `--engine` 检索 Top-2，构建统一 Prompt，调用本地微调模型生成，并打印：
+  1) 问题（User 2）
+  2) 目标检索（Ground Truth KB 提示：即“0) 知识库”）
+  3) 目标输出（Ground Truth Answer = 下一句 User 1）
+  4) 实际检索（Top-K，含 KB 中的 1-based 索引）
+  5) 实际输出（模型生成）
 
-（可选）使用 baseline LightRAG 引擎
+（可选）切换 TF-IDF 引擎：
 
 ```bash
-# 使用 ZHIPUAI_API_KEY 的 LightRAG，检索 book.txt
-export ZHIPUAI_API_KEY=你的密钥
-python run.py --engine lightrag --lightrag_path ./book.txt
-
-# 使用 ZHIPUAI_API_KEY 的 LightRAG，递归检索 ../Synthetic-Persona-Chat/data 目录
-python run.py --engine lightrag --lightrag_path ../Synthetic-Persona-Chat/data
+python run.py --engine tfidf --top_k 2 --verbose \
+  --kb_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_test.csv \
+  --model_path ./my_finetuned_model
 ```
-
-说明：
-- 需要设置环境变量 `ZHIPUAI_API_KEY`。
-- 需要在 `hw1_baseline/` 目录下提供 `book.txt` 作为示例语料。
 
 ### 注意事项
 - 训练参数示例为快速演示，可根据硬件条件调整（序列长度、batch、累积步数、bf16/梯度检查点等）。
 - 如果需要中文或更强的对话能力，请替换模型并相应修改 tokenizer/model 名称。
 
 ### 扩展命令与对比实验
-1) 使用 ZHIPUAI_API_KEY 的 LightRAG 检索：
-```bash
-export ZHIPUAI_API_KEY=你的密钥
-# a) 检索 book.txt
-python run.py --engine lightrag --lightrag_path ./book.txt
-```
-
-2) 使用 rank_bm25 检索 Synthetic-Persona-Chat：
+1) 使用 rank_bm25 检索 Synthetic-Persona-Chat：
 ```bash
 python run.py --engine bm25 --kb_path ../Synthetic-Persona-Chat/data/Synthetic-Persona-Chat_train.csv --top_k 2 --verbose
 ```
 
-3) 评估两种检索效果：
+2) 评估两种检索效果：
 - BM25：
 ```bash
 python evaluate_retrieval.py --top_k 2 --save_trace bm25_trace.json
 ```
-- LightRAG：可复用相同测试样本，统计 rag.query 返回的命中率（需自编评估脚本）。
+- TF-IDF：修改评估脚本为 TF-IDF（或在评估脚本内增加引擎参数）。
 
-4) 使用 Qwen 1.8B 微调（示例，需合适显存与依赖）：
+3) 使用 Qwen 1.8B 微调（示例，需合适显存与依赖）：
 ```bash
 python finetune.py --model_name Qwen/Qwen1.5-1.8B-Chat --trust_remote_code
 ```
 
-5) 检索+微调 vs 直接问答对比：
+4) 检索+微调 vs 直接问答对比：
 - 检索增强：
 ```bash
 python run.py --engine bm25 --top_k 2 --verbose --model_path ./my_finetuned_model
